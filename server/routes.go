@@ -19,13 +19,13 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/jmorganca/ollama/api"
-	"github.com/jmorganca/ollama/llama"
+	"github.com/jmorganca/ollama/llm"
 )
 
 var loaded struct {
 	mu sync.Mutex
 
-	llm *llama.LLM
+	llm llm.LLM
 
 	expireAt    time.Time
 	expireTimer *time.Timer
@@ -72,11 +72,16 @@ func GenerateHandler(c *gin.Context) {
 			loaded.digest = ""
 		}
 
-		llm, err := llama.New(model.ModelPath, opts)
+		llmModel, err := llm.New(model.ModelPath, opts)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
+
+		// set cache values before modifying opts
+		loaded.llm = llmModel
+		loaded.digest = model.Digest
+		loaded.options = opts
 
 		if opts.NumKeep < 0 {
 			promptWithSystem, err := model.Prompt(api.GenerateRequest{})
@@ -91,15 +96,13 @@ func GenerateHandler(c *gin.Context) {
 				return
 			}
 
-			tokensWithSystem := llm.Encode(promptWithSystem)
-			tokensNoSystem := llm.Encode(promptNoSystem)
+			tokensWithSystem := llmModel.Encode(promptWithSystem)
+			tokensNoSystem := llmModel.Encode(promptNoSystem)
 
-			llm.NumKeep = len(tokensWithSystem) - len(tokensNoSystem) + 1
+			opts.NumKeep = len(tokensWithSystem) - len(tokensNoSystem) + 1
+
+			llmModel.SetOptions(opts)
 		}
-
-		loaded.llm = llm
-		loaded.digest = model.Digest
-		loaded.options = opts
 	}
 
 	sessionDuration := 5 * time.Minute

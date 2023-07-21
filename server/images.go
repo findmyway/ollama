@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/jmorganca/ollama/api"
+	"github.com/jmorganca/ollama/llm"
 	"github.com/jmorganca/ollama/parser"
 )
 
@@ -92,9 +93,14 @@ type LayerReader struct {
 }
 
 type ConfigV2 struct {
+	ModelFamily llm.ModelFamily `json:"model_family"`
+	ModelType   llm.ModelType   `json:"model_type"`
+	FileType    llm.FileType    `json:"file_type"`
+	RootFS      RootFS          `json:"rootfs"`
+
+	// required by spec
 	Architecture string `json:"architecture"`
 	OS           string `json:"os"`
-	RootFS       RootFS `json:"rootfs"`
 }
 
 type RootFS struct {
@@ -209,6 +215,11 @@ func CreateModel(name string, path string, fn func(resp api.ProgressResponse)) e
 		return err
 	}
 
+	config := ConfigV2{
+		Architecture: "amd64",
+		OS:           "linux",
+	}
+
 	var layers []*LayerReader
 	params := make(map[string][]string)
 
@@ -248,7 +259,6 @@ func CreateModel(name string, path string, fn func(resp api.ProgressResponse)) e
 						if err != nil {
 							return fmt.Errorf("failed to open file after pull: %v", err)
 						}
-
 					} else {
 						return err
 					}
@@ -262,6 +272,18 @@ func CreateModel(name string, path string, fn func(resp api.ProgressResponse)) e
 					}
 					defer file.Close()
 
+					ggml, err := llm.DecodeGGML(file, llm.ModelFamilyLlama)
+					if err != nil {
+						return err
+					}
+
+					config.ModelFamily = ggml.ModelFamily
+					config.ModelType = ggml.ModelType
+					config.FileType = ggml.FileType
+
+					// reset the file
+					file.Seek(0, io.SeekStart)
+
 					l, err := CreateLayer(file)
 					if err != nil {
 						return fmt.Errorf("failed to create layer: %v", err)
@@ -270,6 +292,7 @@ func CreateModel(name string, path string, fn func(resp api.ProgressResponse)) e
 					layers = append(layers, l)
 				}
 			}
+
 			if mf != nil {
 				log.Printf("manifest = %#v", mf)
 				for _, l := range mf.Layers {
@@ -282,7 +305,6 @@ func CreateModel(name string, path string, fn func(resp api.ProgressResponse)) e
 			}
 		case "license":
 			fn(api.ProgressResponse{Status: fmt.Sprintf("creating model %s layer", c.Name)})
-			// remove the prompt layer if one exists
 			mediaType := fmt.Sprintf("application/vnd.ollama.image.%s", c.Name)
 
 			layer, err := CreateLayer(strings.NewReader(c.Args))
@@ -294,7 +316,7 @@ func CreateModel(name string, path string, fn func(resp api.ProgressResponse)) e
 			layers = append(layers, layer)
 		case "template", "system", "prompt":
 			fn(api.ProgressResponse{Status: fmt.Sprintf("creating model %s layer", c.Name)})
-			// remove the prompt layer if one exists
+			// remove the layer if one exists
 			mediaType := fmt.Sprintf("application/vnd.ollama.image.%s", c.Name)
 			layers = removeLayerFromLayers(layers, mediaType)
 
@@ -339,7 +361,7 @@ func CreateModel(name string, path string, fn func(resp api.ProgressResponse)) e
 
 	// Create a layer for the config object
 	fn(api.ProgressResponse{Status: "creating config layer"})
-	cfg, err := createConfigLayer(digests)
+	cfg, err := createConfigLayer(config, digests)
 	if err != nil {
 		return err
 	}
@@ -526,7 +548,7 @@ func getLayerDigests(layers []*LayerReader) ([]string, error) {
 // CreateLayer creates a Layer object from a given file
 func CreateLayer(f io.ReadSeeker) (*LayerReader, error) {
 	digest, size := GetSHA256Digest(f)
-	f.Seek(0, 0)
+	f.Seek(0, io.SeekStart)
 
 	layer := &LayerReader{
 		Layer: Layer{
@@ -614,10 +636,6 @@ func DeleteModel(name string) error {
 		}
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-
 	if err != nil {
 		return err
 	}
@@ -820,15 +838,10 @@ func pullModelManifest(mp ModelPath, regOpts *RegistryOptions) (*ManifestV2, err
 	return m, err
 }
 
-func createConfigLayer(layers []string) (*LayerReader, error) {
-	// TODO change architecture and OS
-	config := ConfigV2{
-		Architecture: "arm64",
-		OS:           "linux",
-		RootFS: RootFS{
-			Type:    "layers",
-			DiffIDs: layers,
-		},
+func createConfigLayer(config ConfigV2, layers []string) (*LayerReader, error) {
+	config.RootFS = RootFS{
+		Type:    "layers",
+		DiffIDs: layers,
 	}
 
 	configJSON, err := json.Marshal(config)
