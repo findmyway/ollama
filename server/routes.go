@@ -72,7 +72,7 @@ func GenerateHandler(c *gin.Context) {
 			loaded.digest = ""
 		}
 
-		llmModel, err := llm.New(model.ModelPath, opts)
+		llmModel, err := llm.New(model.ModelPath, model.AdapterPaths, opts)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return

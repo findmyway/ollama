@@ -18,7 +18,7 @@ type LLM interface {
 	Close()
 }
 
-func New(model string, opts api.Options) (LLM, error) {
+func New(model string, adapters []string, opts api.Options) (LLM, error) {
 	if _, err := os.Stat(model); err != nil {
 		return nil, err
 	}
@@ -65,7 +65,7 @@ func New(model string, opts api.Options) (LLM, error) {
 
 	switch ggml.ModelFamily {
 	case ModelFamilyLlama:
-		return newLlama(model, opts)
+		return newLlama(model, adapters, opts)
 	default:
 		return nil, fmt.Errorf("unknown ggml type: %s", ggml.ModelFamily)
 	}
