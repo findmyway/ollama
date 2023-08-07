@@ -233,7 +233,8 @@ func CreateModel(name string, path string, fn func(resp api.ProgressResponse)) e
 			fn(api.ProgressResponse{Status: "looking for model"})
 			mf, err := GetManifest(ParseModelPath(c.Args))
 			if err != nil {
-				fp := c.Args
+				fields := strings.Fields(c.Args)
+				fp := fields[0]
 
 				// If filePath starts with ~/, replace it with the user's home directory.
 				if strings.HasPrefix(fp, "~/") {
@@ -283,6 +284,31 @@ func CreateModel(name string, path string, fn func(resp api.ProgressResponse)) e
 					config.ModelFamily = ggml.ModelFamily
 					config.ModelType = ggml.ModelType
 					config.FileType = ggml.FileType
+
+					if len(fields) == 3 && strings.ToUpper(fields[1]) == "AS" {
+						switch config.FileType {
+						case llm.FileTypeF32, llm.FileTypeF16:
+							out, err := os.CreateTemp("", "llama")
+							if err != nil {
+								return err
+							}
+							defer out.Close()
+							defer os.Remove(out.Name())
+
+							fn(api.ProgressResponse{Status: "creating quantized model layer"})
+
+							fileType, err := llm.ParseFileType(ggml.ModelFamily, fields[2])
+							if err != nil {
+								return err
+							}
+
+							if err := llm.Quantize(file.Name(), out.Name(), fileType); err != nil {
+								return err
+							}
+
+							file = out
+						}
+					}
 
 					// reset the file
 					file.Seek(0, io.SeekStart)
