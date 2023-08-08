@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -37,35 +38,17 @@ var loaded struct {
 	options api.Options
 }
 
-func GenerateHandler(c *gin.Context) {
-	loaded.mu.Lock()
-	defer loaded.mu.Unlock()
-
-	checkpointStart := time.Now()
-
-	var req api.GenerateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	model, err := GetModel(req.Model)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
+// load a model into memory if it is not already loaded, it is up to the caller to lock loaded.mu before calling this function
+func load(model *Model, reqOpts map[string]interface{}, sessionDuration time.Duration) error {
 	opts := api.DefaultOptions()
 	if err := opts.FromMap(model.Options); err != nil {
 		log.Printf("could not load model options: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		return err
 	}
 
-	if err := opts.FromMap(req.Options); err != nil {
+	if err := opts.FromMap(reqOpts); err != nil {
 		log.Printf("could not merge model options: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		return err
 	}
 
 	if model.Digest != loaded.digest || !reflect.DeepEqual(loaded.options, opts) {
@@ -82,17 +65,15 @@ func GenerateHandler(c *gin.Context) {
 
 		llm, err := llama.New(model.ModelPath, opts)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
+			return err
 		}
 
 		loaded.llm = llm
 		loaded.digest = model.Digest
 		loaded.options = opts
 	}
-	sessionDuration := 5 * time.Minute
-
 	loaded.expireAt = time.Now().Add(sessionDuration)
+
 	if loaded.expireTimer == nil {
 		loaded.expireTimer = time.AfterFunc(sessionDuration, func() {
 			loaded.mu.Lock()
@@ -112,6 +93,32 @@ func GenerateHandler(c *gin.Context) {
 		})
 	}
 	loaded.expireTimer.Reset(sessionDuration)
+	return nil
+}
+
+func GenerateHandler(c *gin.Context) {
+	loaded.mu.Lock()
+	defer loaded.mu.Unlock()
+
+	checkpointStart := time.Now()
+
+	var req api.GenerateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	model, err := GetModel(req.Model)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	sessionDuration := 5 * time.Minute
+	if err := load(model, req.Options, sessionDuration); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 
 	checkpointLoaded := time.Now()
 
@@ -159,6 +166,67 @@ func GenerateHandler(c *gin.Context) {
 	}()
 
 	streamResponse(c, ch)
+}
+
+func EmbeddingHandler(c *gin.Context) {
+	loaded.mu.Lock()
+	defer loaded.mu.Unlock()
+
+	var req api.EmbeddingRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	model, err := GetModel(req.Model)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := load(model, req.Options, 5*time.Minute); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if !loaded.options.EmbeddingOnly {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "embedding option must be set to true"})
+		return
+	}
+
+	retry := 0
+generate:
+	if retry > 3 {
+		log.Printf("failed to generate embedding for '%s': %v", req.Model, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate embedding"})
+		return
+	}
+	embedding, err := loaded.llm.Embedding(req.Prompt)
+	if err != nil {
+		log.Printf("retrying embedding generation for '%s': %v", req.Model, err)
+		retry++
+		goto generate
+	}
+	// Check for NaN and Inf in the embedding, which can't be stored
+	for _, value := range embedding {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			log.Printf("reloading model, embedding contains NaN or Inf")
+			// reload the model to get a new embedding, the seed can effect these outputs and reloading changes it
+			loaded.llm.Close()
+			loaded.llm = nil
+			loaded.digest = ""
+			if err := load(model, req.Options, 5*time.Minute); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			retry++
+			goto generate
+		}
+	}
+
+	resp := api.EmbeddingResponse{
+		Embedding: embedding,
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func PullModelHandler(c *gin.Context) {
@@ -352,6 +420,7 @@ func Serve(ln net.Listener, extraOrigins []string) error {
 
 	r.POST("/api/pull", PullModelHandler)
 	r.POST("/api/generate", GenerateHandler)
+	r.POST("/api/embedding", EmbeddingHandler)
 	r.POST("/api/create", CreateModelHandler)
 	r.POST("/api/push", PushModelHandler)
 	r.POST("/api/copy", CopyModelHandler)
